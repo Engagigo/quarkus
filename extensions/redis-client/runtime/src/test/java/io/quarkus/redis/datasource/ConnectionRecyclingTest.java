@@ -1,7 +1,9 @@
 package io.quarkus.redis.datasource;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import java.lang.reflect.Proxy;
 import java.time.Duration;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -16,10 +18,13 @@ import io.quarkus.redis.runtime.datasource.ReactivePubSubCommandsImpl;
 import io.quarkus.redis.runtime.datasource.ReactiveRedisDataSourceImpl;
 import io.smallrye.mutiny.Uni;
 import io.smallrye.mutiny.subscription.Cancellable;
+import io.vertx.core.Future;
 import io.vertx.mutiny.redis.client.Redis;
 import io.vertx.mutiny.redis.client.RedisAPI;
 import io.vertx.mutiny.redis.client.RedisConnection;
+import io.vertx.redis.client.Command;
 import io.vertx.redis.client.RedisOptions;
+import io.vertx.redis.client.Request;
 
 public class ConnectionRecyclingTest extends DatasourceTestBase {
 
@@ -251,6 +256,58 @@ public class ConnectionRecyclingTest extends DatasourceTestBase {
         } finally {
             limitedRedis.closeAndAwait();
         }
+    }
+
+    @Test
+    void verifyThatSubscriptionConnectionIsReleasedWhenUnsubscribeFails() {
+        Redis limitedRedis = createLimitedRedis();
+
+        try {
+            Redis failingUnsubscribeRedis = withFailingUnsubscribe(limitedRedis);
+            ReactiveRedisDataSourceImpl limitedDataSource = new ReactiveRedisDataSourceImpl(vertx, failingUnsubscribeRedis,
+                    RedisAPI.api(failingUnsubscribeRedis));
+            ReactivePubSubCommandsImpl<String> pubsub = new ReactivePubSubCommandsImpl<>(limitedDataSource, String.class);
+
+            ReactivePubSubCommands.ReactiveRedisSubscriber subscriber = pubsub.subscribe("channel", message -> {
+            }).await().atMost(Duration.ofSeconds(10));
+
+            assertThatThrownBy(() -> subscriber.unsubscribe().await().atMost(Duration.ofSeconds(10)))
+                    .hasMessageContaining("UNSUBSCRIBE failed");
+
+            // the failure is reported, but the subscription connection must be released anyway
+            RedisConnection recycledConnection = limitedRedis.connect()
+                    .await().atMost(Duration.ofSeconds(5));
+            recycledConnection.closeAndAwait();
+        } finally {
+            limitedRedis.closeAndAwait();
+        }
+    }
+
+    /**
+     * Makes UNSUBSCRIBE fail, as it does with a cluster client when a node has restarted or gone away: the command is
+     * sent to the master of every slot range and fails if one of them is unreachable.
+     */
+    private static Redis withFailingUnsubscribe(Redis redis) {
+        io.vertx.redis.client.Redis delegate = redis.getDelegate();
+        return Redis.newInstance((io.vertx.redis.client.Redis) Proxy.newProxyInstance(
+                ConnectionRecyclingTest.class.getClassLoader(), new Class<?>[] { io.vertx.redis.client.Redis.class },
+                (proxy, method, args) -> method.getName().equals("connect")
+                        ? delegate.connect().map(ConnectionRecyclingTest::failingUnsubscribeConnection)
+                        : method.invoke(delegate, args)));
+    }
+
+    private static io.vertx.redis.client.RedisConnection failingUnsubscribeConnection(
+            io.vertx.redis.client.RedisConnection delegate) {
+        return (io.vertx.redis.client.RedisConnection) Proxy.newProxyInstance(
+                ConnectionRecyclingTest.class.getClassLoader(), new Class<?>[] { io.vertx.redis.client.RedisConnection.class },
+                (proxy, method, args) -> {
+                    if (method.getName().equals("send") && Command.UNSUBSCRIBE.equals(((Request) args[0]).command())) {
+                        return Future.failedFuture(new IllegalStateException("UNSUBSCRIBE failed"));
+                    }
+                    Object result = method.invoke(delegate, args);
+                    // keep the fluent setters (handler, endHandler...) returning the proxy
+                    return result == delegate ? proxy : result;
+                });
     }
 
     private Redis createLimitedRedis() {
